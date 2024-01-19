@@ -7,6 +7,8 @@
 
 This project aims to mint GHO from Bungi's Uniswap v4 LP manager. An implemntation was tried using directly hooks from uniswap v4 but unfortunately hooks don't allow anybody but the owner to modify positions, making it impossible to liquidate users hen their position collateral is inferior to their debt. This may change in the future depending on how uniswap v4 final implementation.
 
+A full project report can be found on [GHOOK hackaton.pdf](https://github.com/HighPointFR/GHOOK-LFGO/files/13992622/GHOOK.hackaton.pdf)
+
 
 
 
