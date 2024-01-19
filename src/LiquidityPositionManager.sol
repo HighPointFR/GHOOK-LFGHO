@@ -223,7 +223,79 @@ contract LiquidityPositionManager is ERC6909, AUniswap{
         }
     }
 
-    
+    /// @notice Given an existing position, liquidate position by repaying debt with a flashloan, then withdrawing collateral
+    ///     This function supports partially withdrawing tokens from an LP to open up a new position
+    /// @param owner The owner of the position
+    /// @param position The position to liquidate
+    /// @param hookLiquidationData the arbitrary bytes to provide to hooks when the existing position is modified
+    function liquidateUser(
+        address owner,
+        Position memory position,
+        bytes calldata hookLiquidationData
+    ) external returns (bool liquidationSuccess) {
+        
+        if(getUserCurrentLTV(owner) < maxLTVUD60x18){
+            revert("User LTV is not at risk of liquidation");
+        }
+
+        uint8 liquidationPremium = 20; //20% of GHO debt to liquidator
+
+        //get user Current Position and debt
+        BorrowerPosition storage currentParams = userPosition[owner];
+
+        //send GHO to this address then burning it
+        bool isTransferSuccess = ERC20(GHO).transferFrom(msg.sender, address(this), currentParams.debt); 
+
+        if(!isTransferSuccess){
+            revert("GHO transferFrom failed");
+        }
+
+        //burn GHO debt
+        IGhoToken(GHO).burn(currentParams.debt);
+
+        //reset user debt to 0
+        userPosition[owner].debt = 0; 
+
+        //burn ERC6909 position tokens
+        _burn(owner, currentParams.position.toTokenId(), uint256(currentParams.liquidity));
+
+
+        //Set Position params to 0 to liquidate
+        IPoolManager.ModifyPositionParams memory liquidationParams = IPoolManager.ModifyPositionParams({
+            tickLower: currentParams.position.tickLower,
+            tickUpper: currentParams.position.tickUpper,
+            liquidityDelta: -int256(int128(currentParams.liquidity))
+        });
+
+       uint256 token0balance = ERC20(WETH).balanceOf(address(this));
+       uint256 token1balance = ERC20(USDC).balanceOf(address(this));
+
+        // interactions, second parameter is receiver of tokens.
+        BalanceDelta delta = abi.decode(
+            manager.lock(
+                abi.encodeCall(
+                    this.handleModifyPosition, abi.encode(CallbackData(msg.sender, address(this), poolKey, liquidationParams, hookLiquidationData))
+                )
+            ),
+            (BalanceDelta)
+        );
+
+        //After the call, balances should be settled and we should receive positions tokens back here.
+        token0balance = ERC20(WETH).balanceOf(address(this)) - token0balance; //get actual received token0 amount after withdrawing position
+        token1balance = ERC20(USDC).balanceOf(address(this)) - token1balance; //get actual received token1 amount after withdrawing position
+
+        console2.log("ETH balance after actual liquidation %e", token0balance);
+        console2.log("USDC balance after actual liquidation %e", token1balance);
+        
+        IERC20(WETH).transferFrom(address(this), msg.sender, (token0balance*liquidationPremium)/100); //send 20% ETH to liquidator as liquidation premium
+        IERC20(USDC).transferFrom(address(this), msg.sender, (token1balance*liquidationPremium)/100); //send 20% USDc to liquidator as liquidation premium
+
+        IERC20(WETH).transferFrom(address(this),address(owner),(token0balance*(100-liquidationPremium)/100)); //send 80% ETH to original user 
+        IERC20(USDC).transferFrom(address(this),address(owner),(token1balance*(100-liquidationPremium)/100)); //send 80% USDC to original user 
+
+        return(userPosition[owner].debt == 0);
+    }
+
 
     function processBalanceDelta(
         address sender,
@@ -257,9 +329,176 @@ contract LiquidityPositionManager is ERC6909, AUniswap{
         }
     }
 
-   
+    function borrowGho(uint256 amount, address user) public returns (bool, uint256){
+
+        //todo add caller is owner check
+        //if amount is inferior to min amount, revert
+        if(amount < minBorrowAmount){
+            revert("Borrow amount to borrow is inferior to 1 GHO");
+        }
+        console2.log("Borrow amount requested %e", amount);    
+        console2.log("User collateral value in USD %e", _getUserLiquidityPriceUSD(user).unwrap() / 10**18);
+        console2.log("Max borrow amount %e", _getUserLiquidityPriceUSD(user).sub((UD60x18.wrap(userPosition[user].debt)).div(UD60x18.wrap(10**ERC20(GHO).decimals()))).mul(maxLTVUD60x18).unwrap());
+
+        //get user position price in USD, then check if borrow amount + debt already owed (adjusted to GHO decimals) is inferior to maxLTV (80% = maxLTV/100)
+        if(_getUserLiquidityPriceUSD(user).lte((UD60x18.wrap((amount+ userPosition[user].debt)).div(UD60x18.wrap(10**ERC20(GHO).decimals()))).div(maxLTVUD60x18))){ 
+            revert("user LTV is superior to maximum LTV"); //TODO add proper error message
+        }
+        userPosition[user].debt =  userPosition[user].debt + amount;
+        console2.log("user debt after borrow %e", userPosition[user].debt);
+        IGhoToken(GHO).mint(user, amount);
+    
+    }
+
+    function viewGhoDebt(address user) public view returns (uint256){
+        return userPosition[user].debt;
+    }
+
+    function repayGho(uint256 amount, address user) public returns (bool){
+        //check if user has debt already
+        if(userPosition[user].debt < amount){
+            revert("user debt is inferior to amount to repay");
+        }
+        //check if user has enough GHO to repay, need to approve first then repay 
+        bool isSuccess = ERC20(GHO).transferFrom(user, address(this), amount); //send GHO to this address then burning it
+        if(!isSuccess){
+            revert("transferFrom failed");
+            return false;
+        }else{
+            IGhoToken(GHO).burn(amount);
+            userPosition[user].debt = userPosition[user].debt - amount;
+            return true;
+        }
+        
+    }
+
+    function _getUserLiquidityPriceUSD(address user) internal view returns (UD60x18){
+        BorrowerPosition memory borrowerPosition = userPosition[user];
+        Position memory positionParams = borrowerPosition.position;
+        PoolKey memory key = positionParams.poolKey;
+
+        (uint160 sqrtPriceX96, int24 currentTick, ,  ) = manager.getSlot0(key.toId()); //curent price and tick of the pool
+        //get user liquidity position stored when adding liquidity
+        
+        return _getPositionUsdPrice(positionParams.tickLower, positionParams.tickUpper, borrowerPosition.liquidity, key);
+    }   
+
+
+    function _getPositionUsdPrice(int24 tickLower, int24 tickUpper, uint128 liquidity, PoolKey memory key) internal view returns (UD60x18){
+        (uint160 sqrtPriceX96, int24 currentTick, ,  ) = manager.getSlot0(key.toId()); //curent price and tick of the pool
+        
+        //Lower and Upper tick of the position
+        uint160 sqrtPriceLower = TickMath.getSqrtRatioAtTick(tickLower); //get price as decimal from Q64.96 format
+        uint160 sqrtPriceUpper = TickMath.getSqrtRatioAtTick(tickUpper);
+        uint256 token0amount;
+        uint256 token1amount;
+
+        //Price calculations on https://blog.uniswap.org/uniswap-v3-math-primer-2#how-to-calculate-current-holdings
+        //Out of range, on the downside
+        if(currentTick < tickLower){
+            token0amount = SqrtPriceMath.getAmount0Delta(
+                sqrtPriceLower,
+                sqrtPriceUpper,
+                liquidity,
+                false
+            );
+            token1amount = 0;
+        //Out of range, on the upside
+        }else if(currentTick >= tickUpper){
+            token0amount = 0;
+            token1amount = SqrtPriceMath.getAmount1Delta(
+                sqrtPriceLower,
+                sqrtPriceUpper,
+                liquidity,
+                false
+            );
+        //in range position
+        }else{
+            token0amount = SqrtPriceMath.getAmount0Delta(
+                sqrtPriceX96,
+                sqrtPriceUpper,
+                liquidity,
+                false
+            );
+            token1amount = SqrtPriceMath.getAmount1Delta(
+                sqrtPriceLower,
+                sqrtPriceX96,
+                liquidity,
+                false
+            );
+        }
+    
+        //Use UD60x18 to convert token amount to decimal adjusted to avoid overflow errors
+        UD60x18 token0amountUD60x18 = UD60x18.wrap(token0amount).div(UD60x18.wrap(10**ERC20(Currency.unwrap(key.currency0)).decimals()));
+        UD60x18 token1amountUD60x18 = UD60x18.wrap(token1amount).div(UD60x18.wrap(10**ERC20(Currency.unwrap(key.currency1)).decimals()));
+
+        console2.log("token0 amount %e", token0amountUD60x18.unwrap());
+        console2.log("token1 amount %e", token1amountUD60x18.unwrap());
+
+        //Price feed from Chainlink, convert to UD60x18 to avoid overflow errors
+        UD60x18 ETHPrice = UD60x18.wrap(uint256(ETHPriceFeed.latestAnswer())).div(UD60x18.wrap(10**ETHPriceFeed.decimals()));
+        UD60x18 USDCPrice = UD60x18.wrap(uint256(USDCPriceFeed.latestAnswer())).div(UD60x18.wrap(10**USDCPriceFeed.decimals()));
+
+        //Price value of each token in the position
+        UD60x18 token0Price = token0amountUD60x18.mul(USDCPrice);
+        UD60x18 token1Price = token1amountUD60x18.mul(ETHPrice);
+
+        console2.log("token0 price %e", token0Price.unwrap());
+        console2.log("token1 price %e", token1Price.unwrap());
+      
+        //return price value of the position as UD60x18
+        return token0Price.add(token1Price);
+
+    }
+
+    function getUserPositonPriceUSD(address user) public view returns (uint256){
+        return _getUserLiquidityPriceUSD(user).unwrap() / 10**18;
+    }
+
+    function getUserCurrentLTV(address user) public view returns (UD60x18){
+        UD60x18 userPositionValueUDx60 = _getUserLiquidityPriceUSD(user); //user position value
+        UD60x18 userDebtUDx60 = UD60x18.wrap(userPosition[user].debt).div(UD60x18.wrap(10**ERC20(GHO).decimals())); //user debt, adjusted to GHO decimals
+
+        return userDebtUDx60.div(userPositionValueUDx60); //return LTV 0 < LTV < 100
+    }
 
     
+    function modifyPriceFeed(address _ETHPriceFeed, address _USDCPriceFeed) public onlyOwner{
+        ETHPriceFeed = EACAggregatorProxy(_ETHPriceFeed);
+        USDCPriceFeed = EACAggregatorProxy(_USDCPriceFeed);
+    }
+
+    function _canUserWithdraw(address user, int24 tickLower, int24 tickUpper, uint128 liquidity) internal view returns (bool){
+        PoolKey memory key = userPosition[user].position.poolKey;
+        
+        //check if debt / (position price - withdraw liquidity amount) is inferior to maxLTV (=77%)
+        console2.log("user debt before trying withdraw %e", userPosition[user].debt / 10**18);
+        console2.log("position value user wants to withdraw %e", _getPositionUsdPrice(tickLower, tickUpper, liquidity, key).unwrap()/ 10**18);
+        //Theorically, position value after withdraw should be superior to 0, but we check just in case
+        UD60x18 _positionValueAfterWithdraw = _getUserLiquidityPriceUSD(user).gte(_getPositionUsdPrice(tickLower, tickUpper, liquidity, key)) ? _getUserLiquidityPriceUSD(user).sub(_getPositionUsdPrice(tickLower, tickUpper, liquidity, key)) : UD60x18.wrap(0);
+        UD60x18 userDebt = UD60x18.wrap(userPosition[user].debt).div(UD60x18.wrap(10**ERC20(GHO).decimals()));
+       
+        if(_positionValueAfterWithdraw.isZero() && userPosition[user].debt == 0){
+            //If user has no debt and withdraw all his position, he can withdraw
+            return true;
+        }else if(_positionValueAfterWithdraw.isZero() && userPosition[user].debt > 0){
+            //If user has debt and withdraw all his position, he cannot withdraw
+            return false;
+        }
+        if(!_positionValueAfterWithdraw.isZero() && userDebt.div(_positionValueAfterWithdraw).lte(maxLTVUD60x18)){
+            //If user has debt and withdraw part of his position, check if debt / (position price - withdraw liquidity amount) is inferior to maxLTV (=77%)
+            console2.log("user LTV after withdraw %e", UD60x18.wrap(userPosition[user].debt).div((UD60x18.wrap((10**ERC20(GHO).decimals()))).div(_positionValueAfterWithdraw)).unwrap());
+            return true;
+        }else{
+            //unhandled case, default to false to avoid user withdrawing more than he should
+            return false;
+        }
+    }
+
+    function getLiquidityforUser(address user) public view returns (uint128){
+        return userPosition[user].liquidity;
+    }
+
     // --- ERC-6909 --- //
     function _mint(address owner, uint256 tokenId, uint256 amount) internal {
         balanceOf[owner][tokenId] += amount;
@@ -276,5 +515,19 @@ contract LiquidityPositionManager is ERC6909, AUniswap{
         return poolKey;
     }
 
-    
+    function getLiquidableUsers(uint n) public view returns (address[] memory){
+        //get n first liquidable users
+        address[] memory liquidableUsers = new address[](n);
+        //loop through users, see if they are liquidable
+        uint24 liquidableUsersCount = 0;
+         for (uint i = 0; i < users.size(); i++) {
+            console2.log("user %s LTV is %e", users.getKeyAtIndex(i), getUserCurrentLTV(users.getKeyAtIndex(i)).unwrap());
+           if(getUserCurrentLTV(users.getKeyAtIndex(i)) >= maxLTVUD60x18){
+                console2.log("user %s is liquidable", users.getKeyAtIndex(i));
+                liquidableUsers[liquidableUsersCount] = (users.getKeyAtIndex(i));
+                liquidableUsersCount++;
+           }
+        }
+        return liquidableUsers;
+    }
 }
